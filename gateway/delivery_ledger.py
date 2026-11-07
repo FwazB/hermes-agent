@@ -365,6 +365,35 @@ def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attemp
             **({"last_error": last_error} if last_error else {}), "attempts": attempts + 1}
 
 
+def _superseded_cron_failure(session_key: str, content: str, created_at: float) -> bool:
+    """Discard only generated cron failure notices proven obsolete by a later success.
+
+    Balance alerts, ordinary replies and uncertain/missing job state retain normal recovery.
+    This reads the current profile's job store; it never changes jobs or their schedules.
+    """
+    if not session_key.startswith("cron:"):
+        return False
+    match = re.match(
+        r"\ACronjob Response: ([^\n]+)\n\(job_id: ([A-Za-z0-9_-]+)\)\n-+\n\n⚠️ Cron '\1' failed:",
+        content,
+    )
+    if match is None:
+        return False
+    try:
+        from datetime import datetime
+        from cron.jobs import get_job
+
+        job = get_job(match.group(2))
+        if not job or job.get("last_status") != "ok":
+            return False
+        last_run = datetime.fromisoformat(job["last_run_at"])
+        return last_run.tzinfo is not None and last_run.timestamp() > created_at
+    except Exception:
+        # Losing the job store must not turn into silently losing its notifications.
+        logger.debug("Could not check whether a cron failure was superseded", exc_info=True)
+        return False
+
+
 def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Optional[set] = None,
                       deliverable_targets: Optional[set] = None) -> list[dict[str, Any]]:
     """Claim undelivered rows owned by dead processes; return them for redelivery.
@@ -399,7 +428,8 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
              owner_pid, owner_started_at, adapter_profile, last_error, updated_at) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
-            if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
+            if (attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS
+                    or _superseded_cron_failure(session_key, content, created_at)):
                 conn.execute(
                     """UPDATE delivery_obligations
                        SET state='abandoned', updated_at=? WHERE obligation_id=?""", (now, oid))
@@ -479,7 +509,8 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
             if due is None:
                 continue
             owner_guard = (now, oid, owner_pid, owner_started_at)
-            if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
+            if (attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS
+                    or _superseded_cron_failure(session_key, content, created_at)):
                 conn.execute(
                     """UPDATE delivery_obligations
                        SET state='abandoned', updated_at=?
